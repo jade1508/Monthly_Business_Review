@@ -1,4 +1,4 @@
-# monthly_business_review
+# Monthly_Performance_DeepDive
 The dashboard is built on top of PnL Snowflake table {{ ref('fct_amazon_kpi_performance') }} combining also inventory, sales velocity and DOC data. 
 This integration includes the computation of essential time-comparison metrics (Month-1, Month-2, Month-12, MoM, YoY, YTD).
 
