@@ -1,0 +1,456 @@
+with listing as (
+    select 
+        country_code,
+        case
+            when country_code = 'TR' then 'EU'
+            when (country_code = 'MX' or country_code = 'BR') then 'US'
+            when (country_code = 'AU' or country_code = 'JP') then 'Other'
+            else sellerx_region
+        end as region
+    from {{ ref('dim_amazon_all_listings_history') }}
+    )
+
+-- inventory data
+, inventory as (
+    select 
+        LAST_DAY(report_date) as month_end_date,
+        extract(month from report_date) as month,
+        extract(year from report_date) as year,
+        asin,
+        case
+            when region = 'AU' or region = 'JP' then 'Other'
+            when region = 'MX' then 'US'
+            else region
+        end as region,
+        SUM(fba_available_stock_qty) fba_stock
+    from {{ ref('fba_oos') }}
+    where report_date = month_end_date
+    group by all
+    )
+
+, doc as (
+    select
+        extract(month from report_date) as month,
+        extract(year from report_date) as year,
+        DATE_TRUNC(month, report_date) as month_start_date,
+        LAST_DAY(report_date) as month_end_date,
+        inv.asin,
+        case
+            when region = 'DE' then 'EU'
+            when region = 'MX' then 'US'
+            when region = 'JP' then 'Other'
+            else region
+        end as region,
+        case when BRAND_NAME = 'KW-Commerce' then NEW_BUSINESS_UNIT else BRAND_NAME end as reporting_brand,
+        ROUND(AVG(h_woc_amz_all_stocks)*DATEDIFF(day,month_start_date, case when month(current_date)=month then current_date else month_end_date end)+1,0) as HV_DOC,
+        ROUND(AVG(dp_woc_amz_all_stocks)*DATEDIFF(day,month_start_date, case when month(current_date)=month then current_date else month_end_date end)+1,0) as DP_DOC,
+        ROUND(AVG(TARGET_COVERAGE_TOTAL)*DATEDIFF(day,month_start_date, case when month(current_date)=month then current_date else month_end_date end)+1,0) as TARGET_DOC,
+        ROUND(AVG(SALES_VELOCITY),0) as HV_SALES_VELOCITY,
+        ROUND(AVG(NEXT_8_WEEK_DAILY_VELOCITY),0) as DP_SALES_VELOCITY
+    from {{ ref('inventory_tracker_open_to_buy') }} as inv
+    left join (select asin, NEW_BUSINESS_UNIT from {{ ref('kw_business_unit') }}) as kwc 
+    on inv.asin = kwc.asin
+    WHERE report_date = month_end_date
+        AND NEW_BUSINESS_UNIT != 'MA'
+    GROUP BY ALL
+
+    UNION
+
+    select 
+        extract(month from ots_date) as month,
+        extract(year from ots_date) as year,
+        DATE_TRUNC(month, ots_date) as month_start_date,
+        LAST_DAY(ots_date) as month_end_date,
+        p.asin,
+        case
+            when g.region = 'MX' then 'US'
+            when g.region = 'JP' then 'Other'
+            else g.region
+        end as region,
+        'MA' as reporting_brand,
+        ROUND(SUM(stock_range_in_days)*DATEDIFF(day,month_start_date, case when month(current_date)=month then current_date else month_end_date end)+1,0) as HV_DOC,
+        null as DP_DOC,
+        null as TARGET_DOC,
+        ROUND(SUM(sales_velocity),0) as HV_SALES_VELOCITY,
+        null as DP_SALES_VELOCITY
+    from {{ ref('fct_kwc_inv_tr_ots') }} g
+    left join
+        (select sku,region,sales_velocity_date,max(sales_velocity) as sales_velocity
+        from {{ ref('fct_kwc_inv_tr_sv') }}
+        where region <> 'WHEU'
+        group by all) s
+    on g.sku = s.sku
+        and g.ots_date = s.sales_velocity_date
+        and g.region = s.region
+    left join (select distinct sku, asin from {{ ref('dim_product') }} ) p
+    on g.sku = p.sku
+    where g.region <> 'WHEU'
+        AND ots_date = month_end_date
+    group by all
+    )
+
+-- pnl data
+, pnl as (
+    select 
+        extract(month from date) as month,
+        extract(year from date) as year,
+        DATE_TRUNC(month, date) as month_start_date,
+        LAST_DAY(date) as month_end_date,
+        pnl.asin as child_asin,
+        parent_asin,
+        IFNULL(reporting_brand,'N/A') as reporting_brand,
+        IFNULL(reporting_brand_new,'N/A') as reporting_brand_new,
+        IFNULL(business_unit,'N/A') as business_unit,
+        IFNULL(business_vertical,'N/A') as business_vertical,
+        IFNULL(division,'N/A') as division,
+        IFNULL(main_category,'N/A') as main_category,
+        IFNULL(sub_category,'N/A') as sub_category,
+        IFNULL(brand_director,'N/A') as brand_director,
+        IFNULL(
+            case
+                when reporting_brand_new = 'MA' then 'Ragnar Amsel'
+                when reporting_brand_new = 'SG' then 'Beatrice Ceresini'
+                when reporting_brand_new = 'HG' then 'Tina Gong'
+                when reporting_brand_new = 'KWC' then null
+                else brand_manager
+            end,'N/A') as brand_manager,
+        marketplace as country,
+        IFNULL(l.region,'N/A') as region,
+        p.product_description,
+        ROUND(SUM(UNITS_SOLD_TOTAL),0) as UNITS_SOLD_TOTAL,
+        ROUND(SUM(REFUNDED_UNITS),0) as REFUNDED_UNITS,
+        ROUND(SUM(GROSS_SALES_REFUNDS_EUR),0)*-1 as GROSS_SALES_REFUNDS,
+        ROUND((SUM(TOTAL_SALES_EUR) + SUM(GIFTWRAP_EUR) + SUM(SHIPPING_EUR)),2) as GROSS_SALES,
+        ROUND(SUM(NET_SALES_EUR),0) as NET_SALES,
+        ROUND(SUM(PROMOTION_EUR),0)*-1 as PROMOTION,
+        ROUND(SUM(VAT_EUR),0)*-1 as VAT,
+        ROUND(SUM(COGS_EUR),0)*-1 as COGS,
+        ROUND(SUM(FBA_STORAGE_EUR),0)*-1 as FBA_STORAGE_FEES,
+        ROUND(SUM(STORAGE_FEES_3PL_EUR) + SUM(WH_RENT_EUR),0)*-1 as STORAGE_3PL_AND_RENT,
+        ROUND(SUM(CM1_EUR),0) as CM1,
+        ROUND(SUM(MARKETPLACE_FEES_EUR),0)*-1 as MARKETPLACE_FEES,
+        ROUND(SUM(FBA_FEES_EUR),0)*-1 as FBA_FEES,
+        ROUND(SUM(FBM_SHIPPING_COST_EUR),0)*-1 as FBM_SHIPPING_COST,
+        ROUND(SUM(CM2_EUR),0) as CM2,
+        ROUND(SUM(CM3_BEFORE_MARKETING_EUR),0) as CM3_BEFORE_MARKETING,
+        ROUND(SUM(CM3_EUR),0) as CM3,
+        ROUND(SUM(CM3_AFTER_WH_EUR),0) as CM3_AFTER_WH,
+        ROUND(SUM(PAID_IMPRESSIONS),0) as PAID_IMPRESSIONS,
+        ROUND(SUM(PAID_CLICKS),0) as PAID_CLICKS,
+        ROUND(SUM(MARKETING_COST_EUR),0)*-1 as AD_SPEND,
+        ROUND(SUM(ATTRIBUTED_UNITS_ORDERED),0) as PAID_UNITS,
+        ROUND(SUM(ATTRIBUTED_SALES_EUR),0) as PAID_GROSS_SALES,
+        ROUND(SUM(TOTAL_SESSIONS),0) as SESSIONS
+    from {{ ref('fct_amazon_kpi_performance') }} pnl
+    left join (select distinct country_code, region from listing) l
+    on pnl.marketplace = l.country_code
+    left join (
+        select distinct asin, min(product_description) as product_description 
+        from {{ ref('dim_product') }} 
+        where asin is not null and product_description is not null and marketplace like 'Amazon%'
+        group by all) p
+    on pnl.asin = p.asin
+    where (marketplace is null or marketplace not in ('MCF','NON-AMAZON'))
+    group by all
+    )
+
+, all_data as (
+    select 
+        pnl.*,
+        ROUND(GROSS_SALES - PAID_GROSS_SALES,0) as ORGANIC_GROSS_SALES,
+        ROUND(DIV0(NET_SALES, UNITS_SOLD_TOTAL),2) as ASP_NET_SALES,
+        ROUND(DIV0(GROSS_SALES, UNITS_SOLD_TOTAL),2) as ASP_GROSS_SALES,
+        ROUND(DIV0(UNITS_SOLD_TOTAL, SESSIONS),0) as CONVERSION,
+        ROUND(DIV0(AD_SPEND, PAID_GROSS_SALES),2) as GROSS_ACOS,
+        ROUND(DIV0(AD_SPEND, NET_SALES),2) as NET_TACOS,
+        ROUND(DIV0(PAID_CLICKS, PAID_IMPRESSIONS),0) as PAID_CTR,
+        ROUND(DIV0(AD_SPEND, PAID_CLICKS),2) as CPC,
+        ROUND(DIV0(GROSS_SALES_REFUNDS, GROSS_SALES),2) as RETURNS_PCT,
+        ROUND(DIV0(PROMOTION, GROSS_SALES),2) as PROMOTION_PCT,
+        ROUND(DIV0(VAT, GROSS_SALES),2) as VAT_PCT,
+        ROUND(DIV0(COGS, NET_SALES),2) as COGS_PCT,
+        ROUND(DIV0(FBA_STORAGE_FEES, NET_SALES),2) as FBA_STORAGE_FEES_PCT,
+        ROUND(DIV0(STORAGE_3PL_AND_RENT, NET_SALES),2) as STORAGE_3PL_AND_RENT_PCT,
+        ROUND(DIV0(CM1, NET_SALES),2) as CM1_PCT,
+        ROUND(DIV0(MARKETPLACE_FEES, NET_SALES),2) as MARKETPLACE_FEES_PCT,
+        ROUND(DIV0(FBA_FEES, NET_SALES),2) as FBA_FEES_PCT,
+        ROUND(DIV0(FBM_SHIPPING_COST, NET_SALES),2) as FBM_SHIPPING_PCT,
+        ROUND(DIV0(CM2, NET_SALES),2) as CM2_PCT,
+        ROUND(DIV0(CM3_BEFORE_MARKETING, NET_SALES),2) as CM3_BEFORE_MKT_PCT,
+        ROUND(DIV0(CM3, NET_SALES),2) as CM3_PCT,
+        ROUND(DIV0(CM3_AFTER_WH, NET_SALES),2) as CM3_AFTER_WH_PCT,
+        ROUND(DIV0(COGS, UNITS_SOLD_TOTAL - REFUNDED_UNITS),1) as COGS_NET_UNIT,
+        ROUND(DIV0(FBA_FEES, UNITS_SOLD_TOTAL - REFUNDED_UNITS),1) as FBA_FEES_NET_UNIT,
+        ROUND(DIV0(MARKETPLACE_FEES, UNITS_SOLD_TOTAL - REFUNDED_UNITS),1) as MARKETPLACE_FEES_NET_UNIT,
+        ROUND(DIV0(CM3_BEFORE_MARKETING, UNITS_SOLD_TOTAL - REFUNDED_UNITS),1) as CM3_BEFORE_MKT_NET_UNIT,
+        ROUND(DIV0(AD_SPEND, UNITS_SOLD_TOTAL - REFUNDED_UNITS),1) as AD_SPEND_NET_UNIT,
+        ROUND(DIV0(CM3, UNITS_SOLD_TOTAL - REFUNDED_UNITS),1) as CM3_NET_UNIT,
+        ROUND(DIV0(CM3_AFTER_WH, UNITS_SOLD_TOTAL - REFUNDED_UNITS),1) as CM3_AFTER_WH_NET_UNIT,
+        ROUND(SUM(fba_stock),0) as fba_stock
+    from pnl
+    left join inventory inv
+    on pnl.month_end_date = inv.month_end_date
+        and pnl.region = inv.region
+        and pnl.child_asin = inv.asin
+    group by all
+    ) 
+
+select
+    a.*,
+    CONCAT(a.reporting_brand_new,a.region,a.year,a.month) as key,
+    CONCAT(a.year,'-',a.month) as year_month,
+    case when (COALESCE(a.fba_stock,0) > 0 and HV_SALES_VELOCITY <= COALESCE(a.fba_stock,0)) then 'In Stock'
+        else 'OOS'
+    end as fba_stock_status,
+
+    HV_DOC,
+    DP_DOC,
+    TARGET_DOC,
+    HV_SALES_VELOCITY,
+    DP_SALES_VELOCITY,
+
+-- M12
+    ROUND(yoy.UNITS_SOLD_TOTAL,0) as UNITS_SOLD_M12,
+    ROUND(yoy.REFUNDED_UNITS,0) as REFUNDED_UNITS_M12,
+    ROUND(yoy.VAT,0) as VAT_M12,
+    ROUND(yoy.PROMOTION,0) as PROMOTION_M12,
+    ROUND(yoy.NET_SALES,0) as NET_SALES_M12,
+    ROUND(yoy.COGS,0) as COGS_M12,
+    ROUND(yoy.FBA_FEES,0) as FBA_FEES_M12,
+    ROUND(yoy.MARKETPLACE_FEES,0) as MARKETPLACE_FEES_M12,
+    ROUND(yoy.PAID_GROSS_SALES,0) as PAID_GROSS_SALES_M12,
+    ROUND(yoy.ORGANIC_GROSS_SALES,0) as ORGANIC_GROSS_SALES_M12,
+    ROUND(yoy.ASP_NET_SALES,2) as ASP_NET_SALES_M12,
+    ROUND(yoy.ASP_GROSS_SALES,2) as ASP_GROSS_SALES_M12,
+    ROUND(yoy.PAID_IMPRESSIONS,0) as PAID_IMPRESSIONS_M12,
+    ROUND(yoy.SESSIONS,0) as SESSIONS_M12,
+    ROUND(yoy.CONVERSION,2) as CONVERSION_M12,
+    ROUND(yoy.NET_TACOS,2) as NET_TACOS_M12,
+    ROUND(yoy.CM3_BEFORE_MARKETING,0) as CM3_BEFORE_MKT_M12,
+    ROUND(yoy.AD_SPEND,0) as AD_SPEND_M12,
+    ROUND(yoy.CM3,0) as CM3_M12,
+    ROUND(yoy.CM3_AFTER_WH,0) as CM3_AFTER_WH_M12,
+    ROUND(yoy.VAT_PCT,2) as VAT_PCT_M12,
+    ROUND(yoy.PROMOTION_PCT,2) as PROMOTION_PCT_M12,
+    ROUND(yoy.RETURNS_PCT,2) as RETURNS_PCT_M12,
+    ROUND(yoy.CM3_BEFORE_MKT_PCT,2) as CM3_BEFORE_MKT_PCT_M12,
+    ROUND(yoy.CM3_PCT,2) as CM3_PCT_M12,
+    ROUND(yoy.COGS_NET_UNIT,1) as COGS_NET_UNIT_M12,
+    ROUND(yoy.FBA_FEES_NET_UNIT,1) as FBA_FEES_NET_UNIT_M12,
+    ROUND(yoy.MARKETPLACE_FEES_NET_UNIT,1) as MPL_FEES_NET_UNIT_M12,
+    ROUND(yoy.CM3_BEFORE_MKT_NET_UNIT,1) as CM3_BEFORE_MKT_NET_UNIT_M12,
+    ROUND(yoy.AD_SPEND_NET_UNIT,1) as AD_SPEND_NET_UNIT_M12,
+    ROUND(yoy.CM3_NET_UNIT,1) as CM3_NET_UNIT_M12,
+    ROUND(yoy.CM3_AFTER_WH_NET_UNIT,1) as CM3_AFTER_WH_NET_UNIT_M12,
+
+-- M-2
+    ROUND(m2.UNITS_SOLD_TOTAL,0) as UNITS_SOLD_M2,
+    ROUND(m2.NET_SALES,0) as NET_SALES_M2,
+    ROUND(m2.PAID_GROSS_SALES,0) as PAID_GROSS_SALES_M2,
+    ROUND(m2.ORGANIC_GROSS_SALES,0) as ORGANIC_GROSS_SALES_M2,
+    ROUND(m2.ASP_NET_SALES,2) as ASP_NET_SALES_M2,
+    ROUND(m2.ASP_GROSS_SALES,2) as ASP_GROSS_SALES_M2,
+    ROUND(m2.PAID_IMPRESSIONS,0) as PAID_IMPRESSIONS_M2,
+    ROUND(m2.SESSIONS,0) as SESSIONS_M2,
+    ROUND(m2.CONVERSION,2) as CONVERSION_M2,
+    ROUND(m2.NET_TACOS,2) as NET_TACOS_M2,
+    ROUND(m2.CM3_BEFORE_MARKETING,0) as CM3_BEFORE_MKT_M2,
+    ROUND(m2.AD_SPEND,0) as AD_SPEND_M2,
+    ROUND(m2.CM3,0) as CM3_M2,
+    ROUND(m2.VAT_PCT,2) as VAT_PCT_M2,
+    ROUND(m2.PROMOTION_PCT,2) as PROMOTION_PCT_M2,
+    ROUND(m2.RETURNS_PCT,2) as RETURNS_PCT_M2,
+    ROUND(m2.CM3_BEFORE_MKT_PCT,2) as CM3_BEFORE_MKT_PCT_M2,
+    ROUND(m2.CM3_PCT,2) as CM3_PCT_M2,
+    ROUND(m2.COGS_NET_UNIT,1) as COGS_NET_UNIT_M2,
+    ROUND(m2.FBA_FEES_NET_UNIT,1) as FBA_FEES_NET_UNIT_M2,
+    ROUND(m2.MARKETPLACE_FEES_NET_UNIT,1) as MPL_FEES_NET_UNIT_M2,
+    ROUND(m2.CM3_BEFORE_MKT_NET_UNIT,1) as CM3_BEFORE_MKT_NET_UNIT_M2,
+    ROUND(m2.AD_SPEND_NET_UNIT,1) as AD_SPEND_NET_UNIT_M2,
+    ROUND(m2.CM3_NET_UNIT,1) as CM3_NET_UNIT_M2,
+    ROUND(m2.CM3_AFTER_WH_NET_UNIT,1) as CM3_AFTER_WH_NET_UNIT_M2,
+  
+-- M-1
+    ROUND(mom.UNITS_SOLD_TOTAL,0) as UNITS_SOLD_M1,
+    ROUND(mom.REFUNDED_UNITS,0) as REFUNDED_UNITS_M1,
+    ROUND(mom.NET_SALES,0) as NET_SALES_M1,
+    ROUND(mom.COGS,0) as COGS_M1,
+    ROUND(mom.FBA_FEES,0) as FBA_FEES_M1,
+    ROUND(mom.PAID_GROSS_SALES,0) as PAID_GROSS_SALES_M1,
+    ROUND(mom.ORGANIC_GROSS_SALES,0) as ORGANIC_GROSS_SALES_M1,
+    ROUND(mom.ASP_NET_SALES,2) as ASP_NET_SALES_M1,
+    ROUND(mom.ASP_GROSS_SALES,2) as ASP_GROSS_SALES_M1,
+    ROUND(mom.PAID_IMPRESSIONS,0) as PAID_IMPRESSIONS_M1,
+    ROUND(mom.SESSIONS,0) as SESSIONS_M1,
+    ROUND(mom.CONVERSION,2) as CONVERSION_M1,
+    ROUND(mom.NET_TACOS,2) as NET_TACOS_M1,
+    ROUND(mom.CM3_BEFORE_MARKETING,0) as CM3_BEFORE_MKT_M1,
+    ROUND(mom.AD_SPEND,0) as AD_SPEND_M1,
+    ROUND(mom.CM3,0) as CM3_M1,
+    ROUND(mom.VAT_PCT,2) as VAT_PCT_M1,
+    ROUND(mom.PROMOTION_PCT,2) as PROMOTION_PCT_M1,
+    ROUND(mom.RETURNS_PCT,2) as RETURNS_PCT_M1,
+    ROUND(mom.CM3_BEFORE_MKT_PCT,2) as CM3_BEFORE_MKT_PCT_M1,
+    ROUND(mom.CM3_PCT,2) as CM3_PCT_M1,
+    ROUND(mom.COGS_NET_UNIT,1) as COGS_NET_UNIT_M1,
+    ROUND(mom.FBA_FEES_NET_UNIT,1) as FBA_FEES_NET_UNIT_M1,
+    ROUND(mom.MARKETPLACE_FEES_NET_UNIT,1) as MPL_FEES_NET_UNIT_M1,
+    ROUND(mom.CM3_BEFORE_MKT_NET_UNIT,1) as CM3_BEFORE_MKT_NET_UNIT_M1,
+    ROUND(mom.AD_SPEND_NET_UNIT,1) as AD_SPEND_NET_UNIT_M1,
+    ROUND(mom.CM3_NET_UNIT,1) as CM3_NET_UNIT_M1,
+    ROUND(mom.CM3_AFTER_WH_NET_UNIT,1) as CM3_AFTER_WH_NET_UNIT_M1,
+
+-- MOM
+    ROUND(a.UNITS_SOLD_TOTAL - mom.UNITS_SOLD_TOTAL,0) as UNITS_SOLD_MOM,
+    ROUND(a.NET_SALES - mom.NET_SALES,0) as NET_SALES_MOM,
+    ROUND(a.PAID_GROSS_SALES - mom.PAID_GROSS_SALES,0) as PAID_GROSS_SALES_MOM,
+    ROUND(a.ORGANIC_GROSS_SALES - mom.ORGANIC_GROSS_SALES,0) as ORGANIC_GROSS_SALES_MOM,
+    ROUND(a.ASP_NET_SALES - mom.ASP_NET_SALES,2) as ASP_NET_SALES_MOM,
+    ROUND(a.ASP_GROSS_SALES - mom.ASP_GROSS_SALES,2) as ASP_GROSS_SALES_MOM,
+    ROUND(a.PAID_IMPRESSIONS - mom.PAID_IMPRESSIONS,0) as PAID_IMPRESSIONS_MOM,
+    ROUND(a.CM3_BEFORE_MARKETING - mom.CM3_BEFORE_MARKETING,0) as CM3_BEFORE_MKT_MOM,
+    ROUND(a.AD_SPEND - mom.AD_SPEND,0) as AD_SPEND_MOM,
+    ROUND(a.CM3 - mom.CM3,0) as CM3_MOM,
+
+-- MOM%    
+    ROUND(DIV0(a.UNITS_SOLD_TOTAL, mom.UNITS_SOLD_TOTAL)-1,2) as UNITS_SOLD_MOM_PCT,
+    ROUND(DIV0(a.NET_SALES, mom.NET_SALES)-1,2) as NET_SALES_MOM_PCT,
+    ROUND(DIV0(a.PAID_GROSS_SALES, mom.PAID_GROSS_SALES)-1,2) as PAID_GROSS_SALES_MOM_PCT,
+    ROUND(DIV0(a.ORGANIC_GROSS_SALES, mom.ORGANIC_GROSS_SALES)-1,2) as ORGANIC_GROSS_SALES_MOM_PCT,
+    ROUND(DIV0(a.ASP_NET_SALES, mom.ASP_NET_SALES)-1,0) as ASP_NET_SALES_MOM_PCT,
+    ROUND(DIV0(a.ASP_GROSS_SALES, mom.ASP_GROSS_SALES)-1,0) as ASP_GROSS_SALES_MOM_PCT,
+    ROUND(DIV0(a.PAID_IMPRESSIONS, mom.PAID_IMPRESSIONS)-1,2) as PAID_IMPRESSIONS_MOM_PCT,
+    ROUND(DIV0(a.SESSIONS, mom.SESSIONS)-1,2) as SESSIONS_MOM_PCT,
+    ROUND((a.CONVERSION - mom.CONVERSION)*100,0) as CONVERSION_MOM_PCT,
+    ROUND((a.NET_TACOS - mom.NET_TACOS)*100,0) as NET_TACOS_MOM_PCT,
+    ROUND(DIV0(a.CM3_BEFORE_MARKETING, mom.CM3_BEFORE_MARKETING)-1,2)*SIGN(mom.CM3_BEFORE_MARKETING) as CM3_BEFORE_MKT_MOM_PCT,
+    ROUND(DIV0(a.AD_SPEND, mom.AD_SPEND)-1,2) as AD_SPEND_MOM_PCT,
+    ROUND(DIV0(a.CM3, mom.CM3)-1,2)*SIGN(mom.CM3) as CM3_MOM_PCT,
+    ROUND((a.VAT_PCT - mom.VAT_PCT)*100,0) as VAT_PCT_MOM_PCT,
+    ROUND((a.PROMOTION_PCT - mom.PROMOTION_PCT)*100,0) as PROMOTION_PCT_MOM_PCT,
+    ROUND((a.RETURNS_PCT - mom.RETURNS_PCT)*100,0) as RETURNS_PCT_MOM_PCT,
+    ROUND((a.CM3_BEFORE_MKT_PCT - mom.CM3_BEFORE_MKT_PCT)*100,0) as CM3_BEFORE_MKT_PCT_MOM_PCT,
+    ROUND((a.CM3_PCT - mom.CM3_PCT)*100,0) as CM3_PCT_MOM_PCT,
+    ROUND(DIV0(a.COGS_NET_UNIT, mom.COGS_NET_UNIT)-1,2) as COGS_NET_UNIT_MOM_PCT,
+    ROUND(DIV0(a.FBA_FEES_NET_UNIT, mom.FBA_FEES_NET_UNIT)-1,2) as FBA_FEES_NET_UNIT_MOM_PCT,
+    ROUND(DIV0(a.MARKETPLACE_FEES_NET_UNIT, mom.MARKETPLACE_FEES_NET_UNIT)-1,2) as MPL_FEES_NET_UNIT_MOM_PCT,
+    ROUND(DIV0(a.CM3_BEFORE_MKT_NET_UNIT, mom.CM3_BEFORE_MKT_NET_UNIT)-1,2)*SIGN(mom.CM3_BEFORE_MKT_NET_UNIT) as CM3_BEFORE_MKT_NET_UNIT_MOM_PCT,
+    ROUND(DIV0(a.AD_SPEND_NET_UNIT, mom.AD_SPEND_NET_UNIT)-1,2) as AD_SPEND_NET_UNIT_MOM_PCT,
+    ROUND(DIV0(a.CM3_NET_UNIT, mom.CM3_NET_UNIT)-1,2)*SIGN(mom.CM3_NET_UNIT) as CM3_NET_UNIT_MOM_PCT,
+    ROUND(DIV0(a.CM3_AFTER_WH_NET_UNIT, mom.CM3_AFTER_WH_NET_UNIT)-1,2)*SIGN(mom.CM3_AFTER_WH_NET_UNIT) as CM3_AFTER_WH_NET_UNIT_MOM_PCT,
+
+-- YOY
+    ROUND(a.UNITS_SOLD_TOTAL - yoy.UNITS_SOLD_TOTAL,0) as UNITS_SOLD_YOY,
+    ROUND(a.NET_SALES - yoy.NET_SALES,0) as NET_SALES_YOY,
+    ROUND(a.PAID_GROSS_SALES - yoy.PAID_GROSS_SALES,0) as PAID_GROSS_SALES_YOY,
+    ROUND(a.ORGANIC_GROSS_SALES - yoy.ORGANIC_GROSS_SALES,0) as ORGANIC_GROSS_SALES_YOY,
+    ROUND(a.ASP_NET_SALES - yoy.ASP_NET_SALES,2) as ASP_NET_SALES_YOY,
+    ROUND(a.ASP_GROSS_SALES - yoy.ASP_GROSS_SALES,2) as ASP_GROSS_SALES_YOY,
+    ROUND(a.PAID_IMPRESSIONS - yoy.PAID_IMPRESSIONS,0) as PAID_IMPRESSIONS_YOY,
+    ROUND(a.SESSIONS - yoy.SESSIONS,0) as SESSIONS_YOY,
+    ROUND(a.CM3_BEFORE_MARKETING - yoy.CM3_BEFORE_MARKETING,0) as CM3_BEFORE_MKT_YOY,
+    ROUND(a.AD_SPEND - yoy.AD_SPEND,0) as AD_SPEND_YOY,
+    ROUND(a.CM3 - yoy.CM3,0) as CM3_YOY,
+    ROUND(a.COGS_NET_UNIT - yoy.COGS_NET_UNIT,0) as COGS_NET_UNIT_YOY,
+    ROUND(a.FBA_FEES_NET_UNIT - yoy.FBA_FEES_NET_UNIT,0) as FBA_FEES_NET_UNIT_YOY,
+    ROUND(a.MARKETPLACE_FEES_NET_UNIT - yoy.MARKETPLACE_FEES_NET_UNIT,0) as MPL_FEES_NET_UNIT_YOY,
+    ROUND(a.CM3_BEFORE_MKT_NET_UNIT - yoy.CM3_BEFORE_MKT_NET_UNIT,0) as CM3_BEFORE_MKT_NET_UNIT_YOY,
+    ROUND(a.AD_SPEND_NET_UNIT - yoy.AD_SPEND_NET_UNIT,0) as AD_SPEND_NET_UNIT_YOY,
+    ROUND(a.CM3_NET_UNIT - yoy.CM3_NET_UNIT,0) as CM3_NET_UNIT_YOY,
+    ROUND(a.CM3_AFTER_WH_NET_UNIT - yoy.CM3_AFTER_WH_NET_UNIT,0) as CM3_AFTER_WH_NET_UNIT_YOY,
+
+-- YOY%    
+    ROUND(DIV0(a.UNITS_SOLD_TOTAL, yoy.UNITS_SOLD_TOTAL)-1,2) as UNITS_SOLD_YOY_PCT,
+    ROUND(DIV0(a.NET_SALES, yoy.NET_SALES)-1,2) as NET_SALES_YOY_PCT,
+    ROUND(DIV0(a.PAID_GROSS_SALES, yoy.PAID_GROSS_SALES)-1,2) as PAID_GROSS_SALES_YOY_PCT,
+    ROUND(DIV0(a.ORGANIC_GROSS_SALES, yoy.ORGANIC_GROSS_SALES)-1,2) as ORGANIC_GROSS_SALES_YOY_PCT,
+    ROUND(DIV0(a.ASP_NET_SALES, yoy.ASP_NET_SALES)-1,0) as ASP_NET_SALES_YOY_PCT,
+    ROUND(DIV0(a.ASP_GROSS_SALES, yoy.ASP_GROSS_SALES)-1,0) as ASP_GROSS_SALES_YOY_PCT,
+    ROUND(DIV0(a.PAID_IMPRESSIONS, yoy.PAID_IMPRESSIONS)-1,2) as PAID_IMPRESSIONS_YOY_PCT,
+    ROUND(DIV0(a.SESSIONS, yoy.SESSIONS)-1,2) as SESSIONS_YOY_PCT,
+    ROUND((a.CONVERSION - yoy.CONVERSION)*100,0) as CONVERSION_YOY_PCT,
+    ROUND((a.NET_TACOS - yoy.NET_TACOS)*100,0) as NET_TACOS_YOY_PCT,
+    ROUND(DIV0(a.CM3_BEFORE_MARKETING, yoy.CM3_BEFORE_MARKETING)-1,2)*SIGN(yoy.CM3_BEFORE_MARKETING) as CM3_BEFORE_MKT_YOY_PCT,
+    ROUND(DIV0(a.AD_SPEND, yoy.AD_SPEND)-1,2) as AD_SPEND_YOY_PCT,
+    ROUND(DIV0(a.CM3, yoy.CM3)-1,2)*SIGN(yoy.CM3) as CM3_YOY_PCT,
+    ROUND((a.VAT_PCT - yoy.VAT_PCT)*100,0) as VAT_PCT_YOY_PCT,
+    ROUND((a.PROMOTION_PCT - yoy.PROMOTION_PCT)*100,0) as PROMOTION_PCT_YOY_PCT,
+    ROUND((a.RETURNS_PCT - yoy.RETURNS_PCT)*100,0) as RETURNS_PCT_YOY_PCT,
+    ROUND((a.CM3_BEFORE_MKT_PCT - yoy.CM3_BEFORE_MKT_PCT)*100,0) as CM3_BEFORE_MKT_PCT_YOY_PCT,
+    ROUND((a.CM3_PCT - yoy.CM3_PCT)*100,0) as CM3_PCT_YOY_PCT,
+    ROUND(DIV0(a.COGS_NET_UNIT, yoy.COGS_NET_UNIT)-1,2) as COGS_NET_UNIT_YOY_PCT,
+    ROUND(DIV0(a.FBA_FEES_NET_UNIT, yoy.FBA_FEES_NET_UNIT)-1,2) as FBA_FEES_NET_UNIT_YOY_PCT,
+    ROUND(DIV0(a.MARKETPLACE_FEES_NET_UNIT, yoy.MARKETPLACE_FEES_NET_UNIT)-1,2) as MPL_FEES_NET_UNIT_YOY_PCT,
+    ROUND(DIV0(a.CM3_BEFORE_MKT_NET_UNIT, yoy.CM3_BEFORE_MKT_NET_UNIT)-1,2)*SIGN(yoy.CM3_BEFORE_MKT_NET_UNIT) as CM3_BEFORE_MKT_NET_UNIT_YOY_PCT,
+    ROUND(DIV0(a.AD_SPEND_NET_UNIT, yoy.AD_SPEND_NET_UNIT)-1,2) as AD_SPEND_NET_UNIT_YOY_PCT,
+    ROUND(DIV0(a.CM3_NET_UNIT, yoy.CM3_NET_UNIT)-1,2)*SIGN(yoy.CM3_NET_UNIT) as CM3_NET_UNIT_YOY_PCT,
+    ROUND(DIV0(a.CM3_AFTER_WH_NET_UNIT, yoy.CM3_AFTER_WH_NET_UNIT)-1,2)*SIGN(yoy.CM3_AFTER_WH_NET_UNIT) as CM3_AFTER_WH_NET_UNIT_YOY_PCT,
+
+-- YTD
+    ROUND(SUM(ytd.UNITS_SOLD_TOTAL),0) as UNITS_SOLD_YTD,
+    ROUND(SUM(ytd.NET_SALES),0) as NET_SALES_YTD,
+    ROUND(SUM(ytd.PAID_GROSS_SALES),0) as PAID_GROSS_SALES_YTD,
+    ROUND(SUM(ytd.GROSS_SALES) - PAID_GROSS_SALES_YTD,0) as ORGANIC_GROSS_SALES_YTD,
+    ROUND(DIV0(NET_SALES_YTD,UNITS_SOLD_YTD),2) as ASP_NET_SALES_YTD,
+    ROUND(DIV0(SUM(ytd.GROSS_SALES),UNITS_SOLD_YTD),2) as ASP_GROSS_SALES_YTD,
+    ROUND(SUM(ytd.PAID_IMPRESSIONS),0) as PAID_IMPRESSIONS_YTD,
+    ROUND(SUM(ytd.SESSIONS),0) as SESSIONS_YTD,
+    ROUND(DIV0(UNITS_SOLD_YTD,SESSIONS_YTD),2) as CONVERSION_YTD,
+    ROUND(DIV0(SUM(ytd.AD_SPEND),NET_SALES_YTD),2) as NET_TACOS_YTD,
+    ROUND(SUM(ytd.CM3_BEFORE_MARKETING),0) as CM3_BEFORE_MKT_YTD,
+    ROUND(SUM(ytd.AD_SPEND),0) as AD_SPEND_YTD,
+    ROUND(SUM(ytd.CM3),0) as CM3_YTD,
+    ROUND(DIV0(SUM(ytd.VAT),NET_SALES_YTD),2) as VAT_PCT_YTD,
+    ROUND(DIV0(SUM(ytd.PROMOTION),SUM(ytd.GROSS_SALES)),2) as PROMOTION_PCT_YTD,
+    ROUND(DIV0(SUM(ytd.GROSS_SALES_REFUNDS),SUM(ytd.GROSS_SALES)),2) as RETURNS_PCT_YTD,
+    ROUND(DIV0(CM3_BEFORE_MKT_YTD, NET_SALES_YTD),2) as CM3_BEFORE_MKT_PCT_YTD,
+    ROUND(DIV0(CM3_YTD, NET_SALES_YTD),2) as CM3_PCT_YTD,
+    ROUND(DIV0(SUM(ytd.COGS), UNITS_SOLD_YTD-SUM(ytd.REFUNDED_UNITS)),1) as COGS_NET_UNIT_YTD,
+    ROUND(DIV0(SUM(ytd.FBA_FEES), UNITS_SOLD_YTD-SUM(ytd.REFUNDED_UNITS)),1) as FBA_FEES_NET_UNIT_YTD,
+    ROUND(DIV0(SUM(ytd.MARKETPLACE_FEES), UNITS_SOLD_YTD-SUM(ytd.REFUNDED_UNITS)),1) as MPL_FEES_NET_UNIT_YTD,
+    ROUND(DIV0(CM3_BEFORE_MKT_YTD, UNITS_SOLD_YTD-SUM(ytd.REFUNDED_UNITS)),1) as CM3_BEFORE_MKT_NET_UNIT_YTD,
+    ROUND(DIV0(AD_SPEND_YTD, UNITS_SOLD_YTD-SUM(ytd.REFUNDED_UNITS)),1) as AD_SPEND_NET_UNIT_YTD,
+    ROUND(DIV0(CM3_YTD, UNITS_SOLD_YTD-SUM(ytd.REFUNDED_UNITS)),1) as CM3_NET_UNIT_YTD,
+    ROUND(DIV0(SUM(ytd.CM3_AFTER_WH), UNITS_SOLD_YTD-SUM(ytd.REFUNDED_UNITS)),1) as CM3_AFTER_WH_NET_UNIT_YTD,
+ 
+-- Run Rate
+    ROUND(DIV0(a.UNITS_SOLD_TOTAL,day(current_date) * DATEDIFF(day,a.month_start_date,a.month_end_date)),0) as UNITS_SOLD_RR,
+    ROUND(DIV0(a.NET_SALES,day(current_date) * DATEDIFF(day,a.month_start_date,a.month_end_date)),0) as NET_SALES_RR,
+    ROUND(DIV0(a.CM3,day(current_date) * DATEDIFF(day,a.month_start_date,a.month_end_date)),0) as CM3_RR,
+
+from all_data a
+
+left join doc d
+on a.child_asin = d.asin
+    and a.reporting_brand = d.reporting_brand
+    and a.region = d.region
+    and a.year = d.year
+    and a.month = d.month
+
+left outer join all_data m2
+on a.child_asin = m2.child_asin
+    and a.reporting_brand_new = m2.reporting_brand_new
+    and a.country = m2.country
+    and DATEADD(month, -2, a.month_start_date) = m2.month_start_date
+
+left outer join all_data mom
+on a.child_asin = mom.child_asin
+    and a.reporting_brand_new = mom.reporting_brand_new
+    and a.country = mom.country
+    and DATEADD(month, -1, a.month_start_date) = mom.month_start_date
+
+left outer join all_data yoy
+on a.child_asin = yoy.child_asin
+    and a.reporting_brand_new = yoy.reporting_brand_new
+    and a.country = yoy.country
+    and DATEADD(year, -1, a.month_start_date) = yoy.month_start_date
+    and a.month = yoy.month
+
+left outer join all_data ytd
+on a.child_asin = ytd.child_asin
+    and a.reporting_brand_new = ytd.reporting_brand_new
+    and a.country = ytd.country
+    and a.year = ytd.year
+    and a.month >= ytd.month
+where a.month_start_date between DATEADD(YEAR, -2, current_date) and current_date
+group by all
